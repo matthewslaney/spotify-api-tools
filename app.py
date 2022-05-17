@@ -16,7 +16,8 @@ Run app.py
 """
 
 import os
-from flask import Flask, session, request, redirect
+from sys import intern
+from flask import Flask, session, request, redirect, flash
 from flask_session import Session
 import flask_excel as excel
 import spotipy
@@ -96,14 +97,30 @@ def sign_out():
 
 
 @app.route('/playlists')
-def playlists():
+def playlists(internal=False):
     auth_manager = spotipy.oauth2.SpotifyOAuth(cache_path=session_cache_path())
 
     if not auth_manager.get_cached_token():
         return redirect('/')
 
     spotify = spotipy.Spotify(auth_manager=auth_manager)
-    return spotify.current_user_playlists()
+    response = spotify.current_user_playlists()
+    users_playlists = response['items']
+    has_next = response['next']
+    offset = response['offset'] + response['limit']
+    print(has_next, offset, len(users_playlists))
+    while has_next:
+        response = spotify.current_user_playlists(offset=offset)
+        users_playlists += response['items']
+        offset = response['offset'] + response['limit']
+        has_next = response['next']
+        print(has_next, offset, len(users_playlists))
+    print(has_next, offset, len(users_playlists))
+    if internal:
+        return users_playlists
+    else:
+        return str(users_playlists)
+        
 
 @app.route('/getallplaylists')
 def getallplaylists():
@@ -113,7 +130,7 @@ def getallplaylists():
         return redirect('/')
 
     spotify = spotipy.Spotify(auth_manager=auth_manager)
-    allplaylists = spotify.current_user_playlists(offset=50)['items']
+    allplaylists = playlists(internal=True)
     full_tracklist = []
     for playlist in allplaylists:
         current_tracklist, current_playlist_name = playlist_to_tracklist(playlist['id'])
@@ -140,6 +157,33 @@ def getplaylistbyid():
     output.headers["Content-type"] = "text/csv"
     return output
 
+@app.route('/uploadtracklist', methods=['GET', 'POST'])
+def upload_tracklist():
+    if request.method == 'POST':
+        if 'file' not in request.files:
+            flash('No file part')
+            return redirect(request.url)
+        file = request.files['file']
+        if file.filename == '':
+            flash('No selected file')
+            return redirect(request.url)
+        tracklist_with_metadata = get_metadata_for_tracklist(list(pd.read_csv(file, header=None)[0]))
+        output = excel.make_response_from_records(tracklist_with_metadata, 'csv')
+        output_filename = "Tracklist With Metadata.csv"
+        output.headers["Content-Disposition"] = "attachment; filename=" + output_filename
+        output.headers["Content-type"] = "text/csv"
+        return output
+
+    return '''
+    <!doctype html>
+    <title>Upload new File</title>
+    <h1>Upload new File</h1>
+    <form method=post enctype=multipart/form-data>
+      <input type=file name=file>
+      <input type=submit value=Upload>
+    </form>
+    '''
+
 
 def session_cache_path():
     return caches_folder + session.get('uuid')
@@ -148,7 +192,7 @@ def playlist_to_tracklist(playlistid):
     auth_manager = spotipy.oauth2.SpotifyOAuth(cache_path=session_cache_path())
     spotify = spotipy.Spotify(auth_manager=auth_manager)
     playlist_main = spotify.playlist(playlistid)
-    tracks =[]
+    tracks = []
     for track in playlist_main['tracks']['items']:
         if track['track'] and track['track']['id']:
             tracks.append(track)
@@ -207,3 +251,59 @@ def playlist_to_tracklist(playlistid):
         tracklist.append(new_track)
     playlist_name = playlist_main['name']
     return tracklist, playlist_name
+
+def get_metadata_for_tracklist(tracklist):
+    auth_manager = spotipy.oauth2.SpotifyOAuth(cache_path=session_cache_path())
+    spotify = spotipy.Spotify(auth_manager=auth_manager)
+    remaining_tracks_to_download = tracklist
+    limit = 50
+    current_offset = 0
+    current_tracks_to_download, returned_tracks, audio_features = [], [], []
+    while len(remaining_tracks_to_download) > 0:
+        print("****\nRemaining tracks to download:\n*****\n\n" + str(len(remaining_tracks_to_download)))
+        if len(remaining_tracks_to_download) > limit:
+            for x in range(limit):
+                current_tracks_to_download.append(remaining_tracks_to_download.pop())
+        else:
+            current_tracks_to_download = remaining_tracks_to_download
+            remaining_tracks_to_download = []
+        returned_tracks = returned_tracks + spotify.tracks(current_tracks_to_download)['tracks']
+        audio_features = audio_features + spotify.audio_features(current_tracks_to_download)
+        current_tracks_to_download = []
+    tracklist_with_metadata = []
+    for track in returned_tracks:
+        track_id = track['id']
+        try:
+            track_audio_features = [af for af in audio_features if af['id'] == track_id][0]
+        except:
+            print(track_id)
+            track_audio_features = defaultdict(dict)
+        other_artists = []
+        if len(track['artists']) > 1:
+            for artist in track['artists'][1:]:
+                other_artists.append(artist['name'])
+        new_track = {
+            'artist': track['artists'][0]['name'],
+            'other_artists': other_artists,
+            'name': track['name'],
+            'id': track['id'],
+            'duration': track['duration_ms'],
+            'url': track['external_urls']['spotify'],
+            'popularity': track['popularity'],
+            'album': track['album']['id'],
+            'release_date': track['album']['release_date'],
+            'acousticness': track_audio_features['acousticness'],
+            'danceability': track_audio_features['danceability'],
+            'energy': track_audio_features['energy'],
+            'instrumentalness': track_audio_features['instrumentalness'],
+            'key': track_audio_features['key'],
+            'liveness': track_audio_features['liveness'],
+            'loudness': track_audio_features['loudness'],
+            'mode': track_audio_features['mode'],
+            'speechiness': track_audio_features['speechiness'],
+            'tempo': track_audio_features['tempo'],
+            'time_signature': track_audio_features['time_signature'],
+            'valence': track_audio_features['valence'],
+        }
+        tracklist_with_metadata.append(new_track)
+    return tracklist_with_metadata
